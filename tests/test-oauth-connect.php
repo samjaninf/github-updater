@@ -34,6 +34,7 @@ class Test_OAuth_Connect extends GU_Test_Case {
 		unset( $_GET['provider'], $_GET['gu_exchange_code'], $_GET['site_state'], $_GET['_wpnonce'], $_POST['provider'], $_POST['_wpnonce'] );
 		foreach ( [ 'github', 'gitlab', 'bitbucket', 'gitea' ] as $provider ) {
 			delete_site_transient( "gu_oauth_state_$provider" );
+			delete_site_transient( 'gu_oauth_auto_removed_' . $provider );
 		}
 		remove_all_filters( 'pre_http_request' );
 		remove_all_filters( 'wp_redirect' );
@@ -47,6 +48,7 @@ class Test_OAuth_Connect extends GU_Test_Case {
 		unset( $_GET['provider'], $_GET['gu_exchange_code'], $_GET['site_state'], $_GET['_wpnonce'], $_POST['provider'], $_POST['_wpnonce'] );
 		foreach ( [ 'github', 'gitlab', 'bitbucket', 'gitea' ] as $provider ) {
 			delete_site_transient( "gu_oauth_state_$provider" );
+			delete_site_transient( 'gu_oauth_auto_removed_' . $provider );
 		}
 		remove_all_actions( 'admin_post_gu_oauth_callback' );
 		remove_all_actions( 'admin_post_gu_oauth_disconnect' );
@@ -1244,5 +1246,170 @@ class Test_OAuth_Connect extends GU_Test_Case {
 		}
 
 		$this->assertArrayNotHasKey( 'github_access_token', API::$options );
+	}
+
+	// -------------------------------------------------------------------------
+	// refresh_token() failure tracking tests
+	// -------------------------------------------------------------------------
+
+	public function test_refresh_failures_increment_on_failure(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'github_access_token'  => 'tok',
+			'github_refresh_token' => 'ref',
+		] );
+
+		add_filter( 'pre_http_request', static function () {
+			return new WP_Error( 'http_error', 'Connection failed' );
+		}, 10, 3 );
+
+		$this->oauth->refresh_token( 'github' );
+		$options = get_site_option( 'git_updater' );
+		$this->assertSame( 1, $options['github_refresh_failures'] );
+
+		$this->oauth->refresh_token( 'github' );
+		$options = get_site_option( 'git_updater' );
+		$this->assertSame( 2, $options['github_refresh_failures'] );
+	}
+
+	public function test_auto_delete_after_3_failures(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'github_access_token'  => 'tok',
+			'github_refresh_token' => 'ref',
+		] );
+
+		add_filter( 'pre_http_request', static function () {
+			return new WP_Error( 'http_error', 'Connection failed' );
+		}, 10, 3 );
+
+		// First two failures increment the counter.
+		$this->oauth->refresh_token( 'github' );
+		$this->oauth->refresh_token( 'github' );
+
+		// Third failure triggers auto-delete.
+		$this->oauth->refresh_token( 'github' );
+
+		$options = get_site_option( 'git_updater' );
+		$this->assertArrayNotHasKey( 'github_access_token', $options );
+		$this->assertArrayNotHasKey( 'github_refresh_token', $options );
+		$this->assertArrayNotHasKey( 'github_is_oauth_token', $options );
+		$this->assertArrayNotHasKey( 'github_refresh_failures', $options );
+		$this->assertFalse( $this->oauth->is_oauth_token( 'github' ) );
+	}
+
+	public function test_auto_delete_sets_notice_transient(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'github_access_token'  => 'tok',
+			'github_refresh_token' => 'ref',
+		] );
+
+		add_filter( 'pre_http_request', static function () {
+			return new WP_Error( 'http_error', 'Connection failed' );
+		}, 10, 3 );
+
+		$this->oauth->refresh_token( 'github' );
+		$this->oauth->refresh_token( 'github' );
+		$this->oauth->refresh_token( 'github' );
+
+		$transient = get_site_transient( 'gu_oauth_auto_removed_github' );
+		$this->assertSame( 'GitHub', $transient );
+	}
+
+	public function test_refresh_failures_reset_on_success(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'gitlab_access_token'  => 'old_tok',
+			'gitlab_refresh_token' => 'ref',
+		] );
+
+		// Two failures.
+		add_filter( 'pre_http_request', static function () {
+			return new WP_Error( 'http_error', 'Connection failed' );
+		}, 10, 3 );
+
+		$this->oauth->refresh_token( 'gitlab' );
+		$this->oauth->refresh_token( 'gitlab' );
+
+		$options = get_site_option( 'git_updater' );
+		$this->assertSame( 2, $options['gitlab_refresh_failures'] );
+
+		// Now a success should reset.
+		add_filter( 'pre_http_request', static function () {
+			return [
+				'response' => [ 'code' => 200 ],
+				'body'     => wp_json_encode( [ 'access_token' => 'new_tok' ] ),
+				'headers'  => [],
+			];
+		}, 10, 4 );
+
+		$result = $this->oauth->refresh_token( 'gitlab' );
+		$this->assertSame( 'new_tok', $result );
+
+		$options = get_site_option( 'git_updater' );
+		$this->assertArrayNotHasKey( 'gitlab_refresh_failures', $options );
+	}
+
+	public function test_refresh_failures_per_provider(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'github_access_token'  => 'gh_tok',
+			'github_refresh_token' => 'gh_ref',
+			'gitlab_access_token'  => 'gl_tok',
+			'gitlab_refresh_token' => 'gl_ref',
+		] );
+
+		add_filter( 'pre_http_request', static function () {
+			return new WP_Error( 'http_error', 'Connection failed' );
+		}, 10, 3 );
+
+		// Three failures for GitHub triggers delete.
+		$this->oauth->refresh_token( 'github' );
+		$this->oauth->refresh_token( 'github' );
+		$this->oauth->refresh_token( 'github' );
+
+		$options = get_site_option( 'git_updater' );
+		$this->assertArrayNotHasKey( 'github_access_token', $options );
+		$this->assertArrayNotHasKey( 'github_refresh_failures', $options );
+
+		// GitLab counter should be unaffected.
+		$this->assertSame( 'gl_tok', $options['gitlab_access_token'] );
+		$this->assertArrayNotHasKey( 'gitlab_refresh_failures', $options );
+	}
+
+	public function test_track_refresh_failure_unknown_provider(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'github_access_token'  => 'tok',
+			'github_refresh_token' => 'ref',
+		] );
+
+		add_filter( 'pre_http_request', static function () {
+			return new WP_Error( 'http_error', 'Connection failed' );
+		}, 10, 3 );
+
+		// Unknown provider still tracks failures via track_refresh_failure.
+		$this->oauth->refresh_token( 'invalid_provider' );
+
+		$options = get_site_option( 'git_updater' );
+		$this->assertSame( 1, $options['invalid_provider_refresh_failures'] );
+	}
+
+	public function test_auto_delete_last_failure_cleans_up_unknown_provider(): void {
+		$this->oauth->connector_url = 'https://connector.example.com/';
+		update_site_option( 'git_updater', [
+			'invalid_provider_refresh_failures' => 2,
+		] );
+
+		// Third failure for unknown provider should try to delete but not crash.
+		$this->oauth->refresh_token( 'invalid_provider' );
+
+		$options = get_site_option( 'git_updater' );
+		// Unknown provider isn't in PROVIDERS, so delete_token does nothing.
+		// But track_refresh_failure runs and the transient is set with ucfirst.
+		$this->assertArrayNotHasKey( 'invalid_provider_refresh_failures', $options );
+		$transient = get_site_transient( 'gu_oauth_auto_removed_invalid_provider' );
+		$this->assertSame( 'Invalid_provider', $transient );
 	}
 }

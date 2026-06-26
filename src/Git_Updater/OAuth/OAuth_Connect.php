@@ -397,6 +397,9 @@ class OAuth_Connect {
 			unset( $options[ $provider . '_token_expires_in' ], $options[ $provider . '_token_acquired_at' ] );
 		}
 
+		// Reset consecutive refresh failure counter on successful save.
+		unset( $options[ $provider . '_refresh_failures' ] );
+
 		update_site_option( 'git_updater', $options );
 		Base::$options = $options;
 		API::$options  = $options;
@@ -409,7 +412,10 @@ class OAuth_Connect {
 	 * @return void
 	 */
 	private function delete_token( string $provider ): void {
-		$config  = self::PROVIDERS[ $provider ];
+		$config = self::PROVIDERS[ $provider ] ?? null;
+		if ( ! $config ) {
+			return;
+		}
 		$options = get_site_option( 'git_updater', [] );
 
 		unset( $options[ $config['option_key'] ] );
@@ -417,9 +423,39 @@ class OAuth_Connect {
 		unset( $options[ $provider . '_token_expires_in' ] );
 		unset( $options[ $provider . '_token_acquired_at' ] );
 		unset( $options[ $provider . '_is_oauth_token' ] );
+		unset( $options[ $provider . '_refresh_failures' ] );
 		update_site_option( 'git_updater', $options );
 		Base::$options = $options;
 		API::$options  = $options;
+	}
+
+	/**
+	 * Track a refresh failure and auto-remove the token after 3 consecutive failures.
+	 *
+	 * @param string $provider Provider slug.
+	 * @return void
+	 */
+	private function track_refresh_failure( string $provider ): void {
+		$options  = get_site_option( 'git_updater', [] );
+		$failures = (int) ( $options[ $provider . '_refresh_failures' ] ?? 0 );
+		++$failures;
+		$options[ $provider . '_refresh_failures' ] = $failures;
+		update_site_option( 'git_updater', $options );
+
+		if ( $failures >= 3 ) {
+			$label = isset( self::PROVIDERS[ $provider ]['label'] ) ? self::PROVIDERS[ $provider ]['label'] : ucfirst( $provider );
+			$this->delete_token( $provider );
+
+			// Ensure the failure counter is cleaned up even for unknown providers.
+			$options = get_site_option( 'git_updater', [] );
+			unset( $options[ $provider . '_refresh_failures' ] );
+			update_site_option( 'git_updater', $options );
+
+			set_site_transient( 'gu_oauth_auto_removed_' . $provider, $label, WEEK_IN_SECONDS );
+			// @codeCoverageIgnoreStart
+			error_log( 'Git Updater: Auto-removed OAuth token for ' . $provider . ' after ' . $failures . ' consecutive refresh failures.' );
+			// @codeCoverageIgnoreEnd
+		}
 	}
 
 	/**
@@ -433,6 +469,7 @@ class OAuth_Connect {
 	public function refresh_token( string $provider ): ?string {
 		$connector = $this->get_connector_url();
 		if ( ! $connector || ! isset( self::PROVIDERS[ $provider ] ) ) {
+			$this->track_refresh_failure( $provider );
 			return null;
 		}
 
@@ -441,6 +478,7 @@ class OAuth_Connect {
 		$refresh_token = $options[ $config['refresh_option_key'] ] ?? null;
 
 		if ( ! $refresh_token ) {
+			$this->track_refresh_failure( $provider );
 			return null;
 		}
 
@@ -456,6 +494,7 @@ class OAuth_Connect {
 
 		if ( is_wp_error( $response ) ) {
 			error_log( 'Git Updater: Token refresh failed for ' . $provider . ': ' . $response->get_error_message() );
+			$this->track_refresh_failure( $provider );
 			return null;
 		}
 
@@ -463,6 +502,7 @@ class OAuth_Connect {
 		if ( empty( $body['access_token'] ) ) {
 			error_log( 'Git Updater: Token refresh failed for ' . $provider . ': No access token received.' );
 			error_log( 'Response body: ' . wp_remote_retrieve_body( $response ) );
+			$this->track_refresh_failure( $provider );
 			return null;
 		}
 

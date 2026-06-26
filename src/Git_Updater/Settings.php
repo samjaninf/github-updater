@@ -349,6 +349,18 @@ class Settings {
 	 */
 	private function admin_page_notices() {
 		if ( ! isset( $_GET['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( wp_unslash( $_GET['_wpnonce'] ) ), 'gu_settings' ) ) {
+			// Check for auto-removed OAuth token notice (set during API requests, no nonce).
+			foreach ( [ 'github', 'gitlab', 'bitbucket', 'gitea' ] as $provider ) {
+				$transient = get_site_transient( 'gu_oauth_auto_removed_' . $provider );
+				if ( $transient ) {
+					delete_site_transient( 'gu_oauth_auto_removed_' . $provider );
+					echo '<div class="error"><p>';
+					/* translators: %s is the provider label, e.g. "GitHub". */
+					printf( esc_html__( 'OAuth token for %s was removed after repeated refresh failures. Please reconnect.', 'git-updater' ), esc_html( $transient ) );
+					echo '</p></div>';
+					break;
+				}
+			}
 			return;
 		}
 		$display = ( isset( $_GET['updated'] ) && is_multisite() )

@@ -557,6 +557,23 @@ class Test_Settings_Admin_Page_Notices_Multisite extends GU_Test_Case {
 		$this->assertStringContainsString( 'Token removed.', $output );
 		$this->assertStringContainsString( 'updated', $output );
 	}
+
+	/**
+	 * Test auto-removed OAuth token notice is displayed (no nonce needed).
+	 */
+	public function test_admin_page_notices_shows_auto_removed_oauth_token(): void {
+		$_GET['tab']    = 'git_updater_settings';
+		$_GET['subtab'] = 'git_updater';
+		set_site_transient( 'gu_oauth_auto_removed_github', 'GitHub', WEEK_IN_SECONDS );
+		add_filter( 'gu_config_pre_process', '__return_empty_array' );
+		ob_start();
+		$this->settings->create_admin_page();
+		$output = ob_get_clean();
+		$this->assertStringContainsString( 'OAuth token for GitHub was removed after repeated refresh failures. Please reconnect.', $output );
+		$this->assertStringContainsString( 'error', $output );
+		// Transient should be deleted after display.
+		$this->assertFalse( get_site_transient( 'gu_oauth_auto_removed_github' ) );
+	}
 }
 
 // =============================================================================
