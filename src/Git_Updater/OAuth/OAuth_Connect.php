@@ -16,7 +16,6 @@ use Fragen\Git_Updater\Base;
  * Class OAuth_Connect
  *
  * Handles OAuth connect/disconnect/callback for all git providers.
- * @phpcs:disable WordPress.PHP.DevelopmentFunctions.error_log_error_log
  */
 class OAuth_Connect {
 
@@ -443,7 +442,7 @@ class OAuth_Connect {
 		$options[ $provider . '_refresh_failures' ] = $failures;
 		update_site_option( 'git_updater', $options );
 
-		if ( $failures >= 5 ) {
+		if ( $failures >= 3 ) {
 			$label = isset( self::PROVIDERS[ $provider ]['label'] ) ? self::PROVIDERS[ $provider ]['label'] : ucfirst( $provider );
 			$this->delete_token( $provider );
 
@@ -464,6 +463,8 @@ class OAuth_Connect {
 	 *
 	 * @param string $provider Provider slug.
 	 * @return string|null New access token or null on failure.
+	 *
+	 * @phpcs:disable WordPress.PHP.DevelopmentFunctions.error_log_error_log
 	 */
 	public function refresh_token( string $provider ): ?string {
 		$connector = $this->get_connector_url();
