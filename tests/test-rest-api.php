@@ -3009,4 +3009,24 @@ class Test_REST_API_Download_Proxy extends WP_UnitTestCase {
 
 		$this->assertTrue( $result );
 	}
+
+	public function test_has_uses_lite_uses_provided_additions_array(): void {
+		$method = new ReflectionMethod( REST_API::class, 'has_uses_lite' );
+		PHP_VERSION_ID < 80100 && $method->setAccessible( true );
+
+		// Option is empty; a true result can only come from the passed array.
+		update_site_option( 'git_updater_additions', [] );
+
+		$additions = [
+			[
+				'slug'      => 'my-plugin/my-plugin.php',
+				'type'      => 'plugin',
+				'uses_lite' => true,
+			],
+		];
+
+		$result = $method->invoke( $this->rest, 'my-plugin', $additions );
+
+		$this->assertTrue( $result );
+	}
 }
