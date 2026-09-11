@@ -82,15 +82,9 @@ class Rest_Update {
 	 * @return void
 	 */
 	public function update_plugin( $plugin_slug, $tag = 'master' ) {
-		$plugin           = null;
 		$is_plugin_active = false;
 
-		foreach ( (array) Singleton::get_instance( 'Fragen\Git_Updater\Plugin', $this )->get_plugin_configs() as $config_entry ) {
-			if ( $config_entry->slug === $plugin_slug ) {
-				$plugin = $config_entry;
-				break;
-			}
-		}
+		$plugin = Singleton::get_instance( 'Fragen\Git_Updater\Plugin', $this )->get_plugin_configs()[ $plugin_slug ] ?? null;
 
 		if ( ! $plugin ) {
 			throw new UnexpectedValueException( 'Plugin not found or not updatable with Git Updater: ' . esc_html( $plugin_slug ) );

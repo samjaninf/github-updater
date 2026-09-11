@@ -494,11 +494,12 @@ class REST_API {
 	 *
 	 * Returns data consistent with `plugins_api()` or `themes_api()` request.
 	 *
-	 * @param WP_REST_Request $request REST API response.
+	 * @param WP_REST_Request                       $request REST API response.
+	 * @param array<int, array<string, mixed>>|null $additions Pre-read Additions option; null reads the option.
 	 *
 	 * @return array<string, mixed>|WP_Error
 	 */
-	public function get_api_data( WP_REST_Request $request ) {
+	public function get_api_data( WP_REST_Request $request, ?array $additions = null ) {
 		$slug = $request->get_param( 'slug' );
 		if ( ! $slug ) {
 			return [ 'error' => 'The REST request likely has an invalid query argument. It requires a `slug`.' ];
@@ -509,7 +510,7 @@ class REST_API {
 		$gu_repos   = array_merge( $gu_plugins, $gu_themes );
 
 		// Don't allow non-shared repos via this API. Set via Additions tab.
-		$additions = get_site_option( 'git_updater_additions', [] );
+		$additions ??= (array) get_site_option( 'git_updater_additions', [] );
 		foreach ( $additions as $addition ) {
 			$addition_slug = str_contains( $addition['type'], 'plugin' ) ? dirname( $addition['slug'] ) : $addition['slug'];
 
@@ -634,7 +635,7 @@ class REST_API {
 		$needs_proxy = $repo_api_data['is_private']
 			|| ! empty( $this->get_class_vars( 'API\API', 'options' )[ $slug ] )
 			|| in_array( $repo_api_data['git'], [ 'gitlab', 'gitea' ], true )
-			|| $this->has_uses_lite( $slug );
+			|| $this->has_uses_lite( $slug, $additions );
 
 		if ( $needs_proxy && ! empty( $repo_api_data['download_link'] ) ) {
 			// Strictly isolate the token URL to the git-updater-lite update-api route.
@@ -673,7 +674,7 @@ class REST_API {
 			if ( array_key_exists( $slug, $gu_tokens ) ) {
 				$file = $gu_tokens[ $slug ]->file;
 				$request->set_param( 'slug', $slug );
-				$api_data[ $slug ] = $this->get_api_data( $request );
+				$api_data[ $slug ] = $this->get_api_data( $request, $additions );
 			}
 		}
 
@@ -725,12 +726,13 @@ class REST_API {
 	/**
 	 * Check if a slug is flagged as using git-updater-lite in Additions.
 	 *
-	 * @param string $slug The package slug (folder name for plugins, theme slug for themes).
+	 * @param string                                $slug The package slug (folder name for plugins, theme slug for themes).
+	 * @param array<int, array<string, mixed>>|null $additions Pre-read Additions option; null reads the option.
 	 *
 	 * @return bool
 	 */
-	private function has_uses_lite( string $slug ): bool {
-		$additions = get_site_option( 'git_updater_additions', [] );
+	private function has_uses_lite( string $slug, ?array $additions = null ): bool {
+		$additions ??= (array) get_site_option( 'git_updater_additions', [] );
 		foreach ( $additions as $addition ) {
 			$addition_slug = str_contains( $addition['type'], 'plugin' ) ? dirname( $addition['slug'] ) : $addition['slug'];
 
