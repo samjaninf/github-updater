@@ -218,6 +218,15 @@ class Install {
 			 */
 			self::$install = apply_filters( 'gu_install_remote_install', self::$install, $headers );
 
+			// A git host add-on can reject the install URL (e.g. Zipfile_API).
+			if ( ! empty( self::$install['error'] ) ) {
+				echo '<h3>';
+				echo esc_html( self::$install['error'] );
+				echo '</h3>';
+
+				return false;
+			}
+
 			if ( isset( self::$install['options'] ) ) {
 				$this->save_options_on_install( self::$install['options'] );
 			}

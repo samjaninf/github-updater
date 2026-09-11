@@ -224,6 +224,32 @@ class Test_REST_API_Dispatch extends WP_UnitTestCase {
 		$this->assertStringContainsString( 'Bad API key', $data['error'] );
 	}
 
+	public function test_repos_endpoint_rejects_empty_key(): void {
+		// An empty key must not satisfy hash_equals( '', '' ).
+		delete_site_option( 'git_updater_api_key' );
+
+		$request = new WP_REST_Request( 'GET', '/git-updater/v1/repos' );
+		$request->set_param( 'key', '' );
+		$response = $this->server->dispatch( $request );
+		$data     = $response->get_data();
+
+		$this->assertArrayHasKey( 'error', $data );
+		$this->assertStringContainsString( 'Bad API key', $data['error'] );
+	}
+
+	public function test_flush_endpoint_rejects_empty_key(): void {
+		delete_site_option( 'git_updater_api_key' );
+
+		$request = new WP_REST_Request( 'GET', '/git-updater/v1/flush-repo-cache' );
+		$request->set_param( 'key', '' );
+		$request->set_param( 'slug', 'any-slug' );
+		$response = $this->server->dispatch( $request );
+		$data     = (array) $response->get_data();
+
+		$this->assertArrayHasKey( 'error', $data );
+		$this->assertStringContainsString( 'Bad API key', $data['error'] );
+	}
+
 	// -------------------------------------------------------------------------
 	// /git-updater/v1/flush-repo-cache
 	// -------------------------------------------------------------------------
@@ -1016,6 +1042,179 @@ class Test_REST_API_Get_Methods extends WP_UnitTestCase {
 
 		$this->assertArrayNotHasKey( 'error', $data );
 	}
+
+	// -------------------------------------------------------------------------
+	// get_api_data() — privacy gate
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Re-declare the mocked repo meta as private.
+	 *
+	 * @param mixed  $preempt Short-circuit value from an earlier filter.
+	 * @param mixed  $args    Request args.
+	 * @param string $url     Request URL.
+	 *
+	 * @return mixed
+	 */
+	public function mock_private_meta( $preempt, $args, $url ) {
+		$path = (string) parse_url( $url, PHP_URL_PATH );
+		if ( '/repos/afragen/test-gu-plugin' !== $path ) {
+			return $preempt;
+		}
+
+		$body = json_decode( (string) ( $preempt['body'] ?? '' ), true );
+		if ( is_array( $body ) && array_key_exists( 'private', $body ) ) {
+			$body['private']   = true;
+			$preempt['body']   = json_encode( $body );
+		}
+
+		return $preempt;
+	}
+
+	private function make_private_repo(): void {
+		/*
+		 * Other test classes mutate the shared Plugin/Theme singletons (see
+		 * test-lite-domains.php, which sets `config` and restores it to `[]`),
+		 * leaving the fixture slug undiscoverable. Reset the singleton cache so
+		 * get_api_data() rebuilds its config from the installed fixture instead
+		 * of inheriting whatever ran before and failing on execution order.
+		 */
+		Singleton::reset();
+		\Fragen\Git_Updater\DB\Repo_Cache_Table::instance()->delete_repo( self::SLUG );
+		add_filter( 'pre_http_request', [ $this, 'mock_private_meta' ], 20, 3 );
+	}
+
+	public function test_get_api_data_returns_403_for_private_repo_without_key(): void {
+		$this->skip_if_fixture_absent();
+		$this->make_private_repo();
+
+		foreach ( [ 'plugins-api', 'themes-api', 'update-api' ] as $route ) {
+			$request = new WP_REST_Request( 'GET', '/git-updater/v1/' . $route );
+			$request->set_param( 'slug', self::SLUG );
+			$response = $this->server->dispatch( $request );
+
+			$this->assertSame( 403, $response->get_status(), "Expected 403 for {$route}" );
+			$this->assertSame( 'gu_private_package', $response->get_data()['code'] );
+		}
+
+		remove_filter( 'pre_http_request', [ $this, 'mock_private_meta' ], 20 );
+	}
+
+	public function test_get_api_data_allows_private_repo_with_authorized_domain(): void {
+		$this->skip_if_fixture_absent();
+		$this->make_private_repo();
+
+		// The lite client presents its own domain on every route, including
+		// update-api, so a configured domain must satisfy the gate uniformly.
+		add_filter( 'git_updater_lite_authorized_domains', fn() => [ 'authorized-domain.com' ] );
+
+		foreach ( [ 'plugins-api', 'themes-api', 'update-api' ] as $route ) {
+			$request = new WP_REST_Request( 'GET', '/git-updater/v1/' . $route );
+			$request->set_param( 'slug', self::SLUG );
+			$request->set_header( 'X-GU-Site-Domain', 'staging.authorized-domain.com' );
+			$response = $this->server->dispatch( $request );
+
+			$this->assertSame( 200, $response->get_status(), "Expected 200 for {$route}" );
+			$this->assertArrayNotHasKey( 'error', (array) $response->get_data() );
+		}
+
+		remove_all_filters( 'git_updater_lite_authorized_domains' );
+		remove_filter( 'pre_http_request', [ $this, 'mock_private_meta' ], 20 );
+	}
+
+	public function test_get_api_data_denies_private_repo_with_unauthorized_domain(): void {
+		$this->skip_if_fixture_absent();
+		$this->make_private_repo();
+
+		add_filter( 'git_updater_lite_authorized_domains', fn() => [ 'authorized-domain.com' ] );
+
+		foreach ( [ 'plugins-api', 'themes-api', 'update-api' ] as $route ) {
+			$request = new WP_REST_Request( 'GET', '/git-updater/v1/' . $route );
+			$request->set_param( 'slug', self::SLUG );
+			$request->set_header( 'X-GU-Site-Domain', 'someone-else.com' );
+			$response = $this->server->dispatch( $request );
+
+			$this->assertSame( 403, $response->get_status(), "Expected 403 for {$route}" );
+		}
+
+		remove_all_filters( 'git_updater_lite_authorized_domains' );
+		remove_filter( 'pre_http_request', [ $this, 'mock_private_meta' ], 20 );
+	}
+
+	public function test_get_api_data_gate_can_be_disabled_by_filter(): void {
+		$this->skip_if_fixture_absent();
+		$this->make_private_repo();
+
+		// Rollout escape hatch: an author whose fleet is still on an older
+		// vendored client can stage enforcement.
+		add_filter( 'gu_enforce_private_package_gate', '__return_false' );
+
+		foreach ( [ 'plugins-api', 'themes-api', 'update-api' ] as $route ) {
+			$request = new WP_REST_Request( 'GET', '/git-updater/v1/' . $route );
+			$request->set_param( 'slug', self::SLUG );
+			$response = $this->server->dispatch( $request );
+
+			$this->assertSame( 200, $response->get_status(), "Expected 200 for {$route}" );
+		}
+
+		remove_all_filters( 'gu_enforce_private_package_gate' );
+		remove_filter( 'pre_http_request', [ $this, 'mock_private_meta' ], 20 );
+	}
+
+	public function test_get_api_data_returns_data_for_private_repo_with_key(): void {
+		$this->skip_if_fixture_absent();
+		$this->make_private_repo();
+
+		foreach ( [ 'plugins-api', 'themes-api', 'update-api' ] as $route ) {
+			$request = new WP_REST_Request( 'GET', '/git-updater/v1/' . $route );
+			$request->set_param( 'slug', self::SLUG );
+			$request->set_param( 'key', self::API_KEY );
+			$response = $this->server->dispatch( $request );
+
+			$this->assertSame( 200, $response->get_status(), "Expected 200 for {$route}" );
+			$this->assertArrayNotHasKey( 'error', (array) $response->get_data() );
+		}
+
+		remove_filter( 'pre_http_request', [ $this, 'mock_private_meta' ], 20 );
+	}
+
+	public function test_get_api_data_stays_open_for_public_repo_without_key(): void {
+		$this->skip_if_fixture_absent();
+
+		\Fragen\Git_Updater\DB\Repo_Cache_Table::instance()->delete_repo( self::SLUG );
+
+		$request = new WP_REST_Request( 'GET', '/git-updater/v1/plugins-api' );
+		$request->set_param( 'slug', self::SLUG );
+		$response = $this->server->dispatch( $request );
+
+		$this->assertSame( 200, $response->get_status() );
+	}
+
+	public function test_get_api_data_returns_error_for_hard_blocked_repo(): void {
+		$this->skip_if_fixture_absent();
+
+		update_site_option(
+			'git_updater_additions',
+			[
+				[
+					'type'            => 'github_plugin',
+					'slug'            => self::SLUG . '/' . self::SLUG . '.php',
+					'private_package' => true,
+				],
+			]
+		);
+
+		$request = new WP_REST_Request( 'GET', '/git-updater/v1/plugins-api' );
+		$request->set_param( 'slug', self::SLUG );
+		$request->set_param( 'key', self::API_KEY );
+		$response = $this->server->dispatch( $request );
+		$data     = (array) $response->get_data();
+
+		delete_site_option( 'git_updater_additions' );
+
+		// Hard block wins even for a key holder.
+		$this->assertSame( 'Specified repo is not shared.', $data['error'] );
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,6 +1534,15 @@ class Test_REST_API_Reset_Branch extends WP_UnitTestCase {
 
 	public function test_reset_branch_bad_key_triggers_wp_die(): void {
 		$request = $this->make_request( [ 'key' => 'wrong-key', 'plugin' => self::SLUG ] );
+		$this->assert_wp_die_thrown( fn() => $this->api->reset_branch( $request ) );
+	}
+
+	public function test_reset_branch_empty_key_triggers_wp_die(): void {
+		// An empty key must not satisfy hash_equals( '', '' ).
+		delete_site_option( 'git_updater_api_key' );
+		$this->force_api_key_static( '' );
+
+		$request = $this->make_request( [ 'key' => '', 'plugin' => self::SLUG ] );
 		$this->assert_wp_die_thrown( fn() => $this->api->reset_branch( $request ) );
 	}
 
@@ -2108,6 +2316,8 @@ class Test_REST_API_Download_Proxy extends WP_UnitTestCase {
 		$this->assertIsArray( $result );
 		$this->assertArrayHasKey( 'download_link', $result );
 		$this->assertNotEmpty( $result['download_link'], 'download_link should not be empty' );
+		$this->assertArrayHasKey( 'is_private', $result );
+		$this->assertFalse( $result['is_private'] );
 		$this->assertArrayHasKey( 'auth_header', $result );
 		$this->assertArrayHasKey( 'headers', $result['auth_header'] );
 	}
@@ -2865,26 +3075,25 @@ class Test_REST_API_Download_Proxy extends WP_UnitTestCase {
 		$this->assertStringContainsString( 'signature=', $data['download_link'] );
 	}
 
-	public function test_get_download_token_returns_403_for_unauthorized_domain(): void {
+	public function test_get_download_token_does_not_gate_public_repo_with_unmatched_domain(): void {
 		$this->skip_if_fixture_absent();
 
-		// Set up authorized domain filter
-		add_filter( 'git_updater_lite_authorized_domains', function () {
-			return [ 'authorized-domain.com' ];
-		} );
+		add_filter( 'pre_http_request', [ $this, 'mock_http_build' ], 10, 3 );
+		add_filter( 'git_updater_lite_authorized_domains', fn() => [ 'authorized-domain.com' ] );
 
 		$GLOBALS['wp_rest_server'] = null;
 		$server = rest_get_server();
 
-		$request  = new WP_REST_Request( 'GET', '/git-updater/v1/download-token/' . self::SLUG );
+		$request = new WP_REST_Request( 'GET', '/git-updater/v1/download-token/' . self::SLUG );
 		$request->set_header( 'X-GU-Site-Domain', 'unauthorized-domain.com' );
 		$response = $server->dispatch( $request );
 
 		remove_all_filters( 'git_updater_lite_authorized_domains' );
+		remove_filter( 'pre_http_request', [ $this, 'mock_http_build' ], 10 );
 
-		$this->assertSame( 403, $response->get_status() );
-		$data = $response->get_data();
-		$this->assertSame( 'gu_unauthorized_domain', $data['code'] );
+		// The fixture repo is public, so the privacy gate does not apply even
+		// though domains are configured for the slug.
+		$this->assertSame( 200, $response->get_status() );
 	}
 
 	public function test_get_download_token_returns_200_for_authorized_domain(): void {

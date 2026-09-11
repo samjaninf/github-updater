@@ -234,7 +234,7 @@ class Lite_Domains {
 	 * @return void
 	 */
 	public function print_section_description() {
-		echo '<p>' . esc_html__( 'Enter comma-separated base domains for each slug. Leave blank to remove domain validation for that slug.', 'git-updater' ) . '</p>';
+		echo '<p>' . esc_html__( 'Enter comma-separated base domains for each slug. Domains are enforced for private repositories — a private package is withheld from the REST API unless the requesting site matches one of its domains or presents the REST API key. Leave blank to remove domain validation for that slug.', 'git-updater' ) . '</p>';
 	}
 
 	/**
@@ -253,7 +253,7 @@ class Lite_Domains {
 			<?php if ( $warning ) : ?>
 				<br>
 				<span class="description" style="color: #d63638; font-weight: bold;">
-					<?php esc_html_e( '⚠️ This repository requires authentication. Add a domain to restrict access.', 'git-updater' ); ?>
+					<?php esc_html_e( '⚠️ This private repository requires authentication. Add a domain to allow it to be served to those sites.', 'git-updater' ); ?>
 				</span>
 			<?php endif; ?>
 		</label>

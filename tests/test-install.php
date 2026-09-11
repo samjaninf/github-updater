@@ -843,6 +843,29 @@ class Test_Install_Install extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A rejected zipfile install URL must bail before the upgrader runs.
+	 *
+	 * @return void
+	 */
+	public function test_install_returns_false_when_zipfile_url_is_rejected(): void {
+		$_POST = [
+			'option_page'        => 'git_updater_install',
+			'_wpnonce'           => wp_create_nonce( 'git_updater_install-options' ),
+			'git_updater_repo'   => 'http://evil.example.com/test-repo',
+			'git_updater_branch' => 'main',
+			'git_updater_api'    => 'zipfile',
+			'zipfile_slug'       => 'test-repo',
+		];
+
+		ob_start();
+		$result = $this->install->install( 'plugin' );
+		$output = ob_get_clean();
+
+		$this->assertFalse( $result );
+		$this->assertStringContainsString( 'allowed git host', $output );
+	}
+
+	/**
 	 * Plugin upgrader success: upgrader extracts a real zip and installs the plugin.
 	 * Covers the truthy branch of $upgrader->install() (line 222) and
 	 * Branch::set_branch_on_install() call (line 223).

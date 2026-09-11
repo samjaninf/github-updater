@@ -134,6 +134,21 @@ class Test_REST_Download_Proxy extends GU_Test_Case {
 		$this->assertFalse( $this->call_verify( 'different-slug', $expires, $signature ) );
 	}
 
+	public function test_verify_invalid_signature_logs_detail_when_debug_filter_enabled(): void {
+		// The expected signature and secret length are only written to the log
+		// when explicitly debugging, since they are a working credential.
+		add_filter( 'gu_debug_download_signature', '__return_true' );
+
+		$expires   = time() + 300;
+		$signature = str_repeat( '0', 64 );
+
+		$result = $this->call_verify( self::SLUG, $expires, $signature );
+
+		remove_all_filters( 'gu_debug_download_signature' );
+
+		$this->assertFalse( $result );
+	}
+
 	public function test_sign_then_verify_round_trips(): void {
 		$params = $this->parse_signed_url( $this->call_sign_download_url( self::SLUG, 120 ) );
 
@@ -421,8 +436,88 @@ class Test_REST_Download_Proxy extends GU_Test_Case {
 	}
 
 	// -------------------------------------------------------------------------
+	// get_download_token() — privacy gate
+	// -------------------------------------------------------------------------
+
+	public function test_get_download_token_returns_403_for_private_repo_without_credential(): void {
+		$this->rest->mock_metadata = [ 'download_link' => 'https://example.com/package.zip', 'is_private' => true ];
+
+		$response = $this->rest->get_download_token( $this->make_token_request() );
+
+		$this->assertWPError( $response );
+		$this->assertSame( 'gu_unauthorized_domain', $response->get_error_code() );
+		$this->assertSame( 403, $response->get_error_data()['status'] );
+	}
+
+	public function test_get_download_token_returns_403_for_private_repo_with_unauthorized_domain(): void {
+		$this->rest->mock_metadata = [ 'download_link' => 'https://example.com/package.zip', 'is_private' => true ];
+
+		add_filter( 'git_updater_lite_authorized_domains', fn() => [ 'authorized-domain.com' ] );
+		$request = $this->make_token_request();
+		$request->set_header( 'X-GU-Site-Domain', 'unauthorized-domain.com' );
+		$response = $this->rest->get_download_token( $request );
+		remove_all_filters( 'git_updater_lite_authorized_domains' );
+
+		$this->assertWPError( $response );
+		$this->assertSame( 403, $response->get_error_data()['status'] );
+	}
+
+	public function test_get_download_token_returns_200_for_private_repo_with_authorized_domain(): void {
+		$this->rest->mock_metadata = [ 'download_link' => 'https://example.com/package.zip', 'is_private' => true ];
+
+		add_filter( 'git_updater_lite_authorized_domains', fn() => [ 'authorized-domain.com' ] );
+		$request = $this->make_token_request();
+		$request->set_header( 'X-GU-Site-Domain', 'staging.authorized-domain.com' );
+		$response = $this->rest->get_download_token( $request );
+		remove_all_filters( 'git_updater_lite_authorized_domains' );
+
+		$this->assertNotWPError( $response );
+		$this->assertStringContainsString( 'signature=', $response->get_data()['download_link'] );
+	}
+
+	public function test_get_download_token_returns_200_for_private_repo_with_api_key(): void {
+		$this->rest->mock_metadata = [ 'download_link' => 'https://example.com/package.zip', 'is_private' => true ];
+
+		$response = $this->rest->get_download_token( $this->make_token_request( self::API_KEY ) );
+
+		$this->assertNotWPError( $response );
+		$this->assertStringContainsString( 'signature=', $response->get_data()['download_link'] );
+	}
+
+	public function test_get_download_token_returns_200_for_public_repo_without_credential(): void {
+		$this->rest->mock_metadata = [ 'download_link' => 'https://example.com/package.zip', 'is_private' => false ];
+
+		$response = $this->rest->get_download_token( $this->make_token_request() );
+
+		$this->assertNotWPError( $response );
+	}
+
+	public function test_get_download_token_gate_can_be_disabled_by_filter(): void {
+		$this->rest->mock_metadata = [ 'download_link' => 'https://example.com/package.zip', 'is_private' => true ];
+
+		// Same rollout escape hatch as get_api_data(), so a staged rollout
+		// cannot leave the two endpoints disagreeing.
+		add_filter( 'gu_enforce_private_package_gate', '__return_false' );
+		$response = $this->rest->get_download_token( $this->make_token_request() );
+		remove_all_filters( 'gu_enforce_private_package_gate' );
+
+		$this->assertNotWPError( $response );
+		$this->assertStringContainsString( 'signature=', $response->get_data()['download_link'] );
+	}
+
+	// -------------------------------------------------------------------------
 	// Helpers
 	// -------------------------------------------------------------------------
+
+	private function make_token_request( ?string $key = null ): WP_REST_Request {
+		$request = new WP_REST_Request( 'GET', '/git-updater/v1/download-token/' . self::SLUG );
+		$request->set_param( 'slug', self::SLUG );
+		if ( null !== $key ) {
+			$request->set_param( 'key', $key );
+		}
+
+		return $request;
+	}
 
 	private function call_sign_download_url( string $slug, int $ttl = 43200 ): string {
 		$method = new ReflectionMethod( REST_API::class, 'sign_download_url' );

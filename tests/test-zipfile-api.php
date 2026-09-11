@@ -103,30 +103,90 @@ class Test_Zipfile_API extends WP_UnitTestCase {
 	}
 
 	public function test_remote_install_sets_download_link_from_uri(): void {
-		$headers = [ 'uri' => 'https://example.com/my-plugin.zip', 'original' => 'https://fallback.com/file.zip' ];
+		$headers = [ 'uri' => 'https://github.com/owner/my-plugin.zip', 'original' => 'https://gitlab.com/owner/file.zip' ];
 		$install = [ 'zipfile_slug' => 'my-plugin' ];
 
 		$result = $this->api->remote_install( $headers, $install );
 
-		$this->assertSame( 'https://example.com/my-plugin.zip', $result['download_link'] );
+		$this->assertSame( 'https://github.com/owner/my-plugin.zip', $result['download_link'] );
 	}
 
 	public function test_remote_install_falls_back_to_original_when_uri_empty(): void {
-		$headers = [ 'uri' => '', 'original' => 'https://fallback.com/file.zip' ];
+		$headers = [ 'uri' => '', 'original' => 'https://gitlab.com/owner/file.zip' ];
 		$install = [ 'zipfile_slug' => 'my-plugin' ];
 
 		$result = $this->api->remote_install( $headers, $install );
 
-		$this->assertSame( 'https://fallback.com/file.zip', $result['download_link'] );
+		$this->assertSame( 'https://gitlab.com/owner/file.zip', $result['download_link'] );
 	}
 
 	public function test_remote_install_sets_git_updater_install_repo_from_zipfile_slug(): void {
-		$headers = [ 'uri' => 'https://example.com/my-plugin.zip', 'original' => '' ];
+		$headers = [ 'uri' => 'https://github.com/owner/my-plugin.zip', 'original' => '' ];
 		$install = [ 'zipfile_slug' => 'my-plugin' ];
 
 		$result = $this->api->remote_install( $headers, $install );
 
 		$this->assertSame( 'my-plugin', $result['git_updater_install_repo'] );
+	}
+
+	public function test_remote_install_rejects_non_https_url(): void {
+		$headers = [ 'uri' => 'http://github.com/owner/my-plugin.zip', 'original' => '' ];
+		$install = [ 'zipfile_slug' => 'my-plugin' ];
+
+		$result = $this->api->remote_install( $headers, $install );
+
+		$this->assertSame( '', $result['download_link'] );
+		$this->assertArrayNotHasKey( 'git_updater_install_repo', $result );
+	}
+
+	public function test_remote_install_rejects_disallowed_host(): void {
+		$headers = [ 'uri' => 'https://evil.example.com/my-plugin.zip', 'original' => '' ];
+		$install = [ 'zipfile_slug' => 'my-plugin' ];
+
+		$result = $this->api->remote_install( $headers, $install );
+
+		$this->assertSame( '', $result['download_link'] );
+	}
+
+	public function test_remote_install_sets_error_on_rejection(): void {
+		$headers = [ 'uri' => 'https://evil.example.com/my-plugin.zip', 'original' => '' ];
+		$install = [ 'zipfile_slug' => 'my-plugin' ];
+
+		$result = $this->api->remote_install( $headers, $install );
+
+		$this->assertNotEmpty( $result['error'] );
+	}
+
+	public function test_remote_install_allows_filtered_host(): void {
+		add_filter(
+			'gu_install_allowed_hosts',
+			function ( $hosts ) {
+				$hosts[] = 'example.com';
+
+				return $hosts;
+			}
+		);
+
+		$headers = [ 'uri' => 'https://example.com/my-plugin.zip', 'original' => '' ];
+		$install = [ 'zipfile_slug' => 'my-plugin' ];
+		$result  = $this->api->remote_install( $headers, $install );
+
+		remove_all_filters( 'gu_install_allowed_hosts' );
+
+		$this->assertSame( 'https://example.com/my-plugin.zip', $result['download_link'] );
+	}
+
+	public function test_remote_install_allows_configured_gitea_server_host(): void {
+		update_site_option( 'git_updater', [ 'gitea_server' => 'https://gitea.example.com' ] );
+
+		$headers = [ 'uri' => 'https://gitea.example.com/owner/my-plugin.zip', 'original' => '' ];
+		$install = [ 'zipfile_slug' => 'my-plugin' ];
+		$result  = $this->api->remote_install( $headers, $install );
+
+		delete_site_option( 'git_updater' );
+
+		$this->assertSame( 'https://gitea.example.com/owner/my-plugin.zip', $result['download_link'] );
+		$this->assertArrayNotHasKey( 'error', $result );
 	}
 
 	public function test_set_remote_install_data_returns_install_unchanged_for_non_zipfile_api(): void {
@@ -143,11 +203,11 @@ class Test_Zipfile_API extends WP_UnitTestCase {
 			'git_updater_api' => 'zipfile',
 			'zipfile_slug'    => 'my-plugin',
 		];
-		$headers = [ 'uri' => 'https://example.com/my-plugin.zip', 'original' => '' ];
+		$headers = [ 'uri' => 'https://github.com/owner/my-plugin.zip', 'original' => '' ];
 
 		$result = $this->api->set_remote_install_data( $install, $headers );
 
-		$this->assertSame( 'https://example.com/my-plugin.zip', $result['download_link'] );
+		$this->assertSame( 'https://github.com/owner/my-plugin.zip', $result['download_link'] );
 		$this->assertSame( 'my-plugin', $result['git_updater_install_repo'] );
 	}
 }

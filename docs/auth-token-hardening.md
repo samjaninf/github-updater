@@ -95,7 +95,14 @@ For `plugins-api`/`themes-api`: existing behavior unchanged.
 
 ## Signed URL TTL
 
-Proxy URLs expire in 5 minutes. Lite caches API responses for 6 hours. Stale downloads fail with 403; WordPress re-checks on next cycle. This is acceptable — a brief delay for stale-cache scenarios. The 5-minute TTL is the secure default.
+Two TTLs are in use, and both must stay at least as long as the cache that stores the link:
+
+- **Proxy URLs** (`/download/{slug}`) default to **12 hours** (`sign_download_url()`, matching the `API::$hours` repo-cache window). The link is persisted inside the `update_plugins` / `update_themes` transients and reused whenever the admin acts, so a shorter TTL would hand the upgrader an expired signature — e.g. metadata fetched now, "Update" clicked six hours later.
+- **Token URLs** (`/download-token/{slug}`, the lite 2-step flow) use **60 seconds**, because the client mints and redeems them immediately.
+
+Earlier revisions of this document said 5 minutes; that was never the implemented default and is not the current behaviour.
+
+> Historical note: the pre-fix shape described at the top of this document (cleartext `auth_header` in the `update-api` response) no longer exists. `auth_header` is built only in `build_download_metadata()` and is consumed server-side by `proxy_download()`; it is never returned to a client on any route.
 
 ## Verification
 

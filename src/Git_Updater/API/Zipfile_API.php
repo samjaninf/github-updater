@@ -119,9 +119,82 @@ class Zipfile_API {
 	 * @return array<string, mixed>
 	 */
 	public function remote_install( $headers, $install ) {
-		$install['download_link']            = ! empty( $headers['uri'] ) ? $headers['uri'] : $headers['original'];
+		$url = ! empty( $headers['uri'] ) ? $headers['uri'] : $headers['original'];
+
+		// The posted URI becomes the upgrader's download_link, so it must not be
+		// able to point at an arbitrary host.
+		if ( ! $this->is_allowed_install_url( (string) $url ) ) {
+			$install['error']         = esc_html__( 'Zipfile install requires an https URL from an allowed git host.', 'git-updater' );
+			$install['download_link'] = '';
+
+			return $install;
+		}
+
+		$install['download_link']            = $url;
 		$install['git_updater_install_repo'] = $install['zipfile_slug'];
 
 		return $install;
+	}
+
+	/**
+	 * Whether a zipfile install URL is https and on an allowed host.
+	 *
+	 * @param string $url The posted repository URI.
+	 *
+	 * @return bool
+	 */
+	private function is_allowed_install_url( string $url ): bool {
+		$parts = wp_parse_url( $url );
+		if ( empty( $parts['scheme'] ) || 'https' !== strtolower( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+			return false;
+		}
+
+		$host = strtolower( $parts['host'] );
+		foreach ( $this->get_allowed_install_hosts() as $allowed ) {
+			if ( $host === $allowed || str_ends_with( $host, '.' . $allowed ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Hosts allowed as a zipfile install source.
+	 *
+	 * Self-hosted GitLab / Bitbucket Server / Gitea cannot be enumerated
+	 * statically, so configured hosts are derived from the site's own options
+	 * and repos, and the list is filterable.
+	 *
+	 * @return array<int, string>
+	 */
+	private function get_allowed_install_hosts(): array {
+		$hosts = [ 'github.com', 'gitlab.com', 'bitbucket.org' ];
+
+		$options = get_site_option( 'git_updater', [] );
+		if ( ! empty( $options['gitea_server'] ) ) {
+			$hosts[] = (string) wp_parse_url( $options['gitea_server'], PHP_URL_HOST );
+		}
+
+		$repos = array_merge(
+			\Fragen\Singleton::get_instance( 'Fragen\Git_Updater\Plugin', $this )->get_plugin_configs(),
+			\Fragen\Singleton::get_instance( 'Fragen\Git_Updater\Theme', $this )->get_theme_configs()
+		);
+		foreach ( $repos as $repo ) {
+			foreach ( [ $repo->enterprise ?? '', $repo->enterprise_api ?? '', $repo->uri ?? '' ] as $candidate ) {
+				$hosts[] = (string) wp_parse_url( (string) $candidate, PHP_URL_HOST );
+			}
+		}
+
+		$hosts[] = (string) wp_parse_url( home_url(), PHP_URL_HOST );
+
+		/**
+		 * Filter the hosts allowed as a zipfile remote install source.
+		 *
+		 * @since 14.4.3
+		 *
+		 * @param array<int, string> $hosts Allowed hostnames.
+		 */
+		return array_values( array_unique( array_filter( array_map( 'strtolower', (array) apply_filters( 'gu_install_allowed_hosts', $hosts ) ) ) ) );
 	}
 }

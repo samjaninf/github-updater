@@ -122,6 +122,10 @@ class REST_API {
 								'required'          => true,
 								'validate_callback' => 'sanitize_title_with_dashes',
 							],
+							'key'  => [
+								'default'           => null,
+								'validate_callback' => 'sanitize_text_field',
+							],
 						],
 					],
 					[
@@ -134,6 +138,10 @@ class REST_API {
 								'default'           => false,
 								'required'          => true,
 								'validate_callback' => 'sanitize_title_with_dashes',
+							],
+							'key'  => [
+								'default'           => null,
+								'validate_callback' => 'sanitize_text_field',
 							],
 						],
 					],
@@ -194,6 +202,10 @@ class REST_API {
 						'slug' => [
 							'required'          => true,
 							'sanitize_callback' => 'sanitize_title_with_dashes',
+						],
+						'key'  => [
+							'default'           => null,
+							'validate_callback' => 'sanitize_text_field',
 						],
 					],
 				],
@@ -440,7 +452,8 @@ class REST_API {
 	 */
 	public function get_remote_repo_data( WP_REST_Request $request ) {
 		// Test for API key and exit if incorrect.
-		if ( ! hash_equals( (string) $this->get_class_vars( 'Remote_Management', 'api_key' ), (string) $request->get_param( 'key' ) ) ) {
+		$key = (string) $request->get_param( 'key' );
+		if ( ! $key || ! hash_equals( (string) get_site_option( 'git_updater_api_key' ), $key ) ) {
 			return [ 'error' => 'Bad API key. No repo data for you.' ];
 		}
 		$slugs      = [];
@@ -511,14 +524,8 @@ class REST_API {
 
 		// Don't allow non-shared repos via this API. Set via Additions tab.
 		$additions ??= (array) get_site_option( 'git_updater_additions', [] );
-		foreach ( $additions as $addition ) {
-			$addition_slug = str_contains( $addition['type'], 'plugin' ) ? dirname( $addition['slug'] ) : $addition['slug'];
-
-			if ( $addition_slug === $slug ) {
-				if ( isset( $addition['private_package'] ) && true === (bool) $addition['private_package'] ) {
-					return [ 'error' => 'Specified repo is not shared.' ];
-				}
-			}
+		if ( $this->is_hard_blocked( $slug, $additions ) ) {
+			return [ 'error' => 'Specified repo is not shared.' ];
 		}
 
 		if ( ! array_key_exists( $slug, $gu_repos ) ) {
@@ -613,6 +620,27 @@ class REST_API {
 		];
 		uksort( $repo_api_data['versions'], fn ( $a, $b ) => version_compare( $b, $a ) );
 
+		// Private repos are withheld from unauthenticated callers on every route,
+		// including `update-api`. Placed here because `is_private` only exists
+		// once $repo_api_data is built above; denying before the release-asset
+		// block also skips that remote call.
+		//
+		// git-updater-lite presents X-GU-Site-Domain on its update-api request
+		// (Lite::run()), so a lite client passes via domain validation. Clients
+		// older than that release send no headers on this route and are denied;
+		// `gu_enforce_private_package_gate` is the staging opt-out for an author
+		// whose fleet has not caught up. The `private_package` hard block above
+		// still applies to every caller and is not filterable.
+		if ( apply_filters( 'gu_enforce_private_package_gate', true, $slug )
+			&& $this->requires_auth( (bool) $repo_api_data['is_private'] )
+			&& ! $this->request_is_authorized( $request, $slug ) ) {
+			return new WP_Error(
+				'gu_private_package',
+				'Specified repo is not shared.',
+				[ 'status' => 403 ]
+			);
+		}
+
 		$repo_cache = $this->get_repo_cache( $slug, false, [ 'release_asset_download', 'release_asset' ] );
 		$api        = Singleton::get_instance( 'Fragen\Git_Updater\API\API', $this );
 
@@ -665,9 +693,9 @@ class REST_API {
 		$additions  = (array) get_site_option( 'git_updater_additions', [] );
 
 		foreach ( $additions as $addition ) {
-			$slug = str_contains( $addition['type'], 'plugin' ) ? dirname( $addition['slug'] ) : $addition['slug'];
+			$slug = $this->get_addition_slug( (array) $addition );
 
-			if ( isset( $addition['private_package'] ) && true === (bool) $addition['private_package'] ) {
+			if ( ! empty( $addition['private_package'] ) ) {
 				continue;
 			}
 
@@ -707,7 +735,8 @@ class REST_API {
 	 */
 	public function flush_repo_cache( $request ) {
 		// Test for API key and exit if incorrect.
-		if ( ! hash_equals( (string) $this->get_class_vars( 'Remote_Management', 'api_key' ), (string) $request->get_param( 'key' ) ) ) {
+		$key = (string) $request->get_param( 'key' );
+		if ( ! $key || ! hash_equals( (string) get_site_option( 'git_updater_api_key' ), $key ) ) {
 			return (object) [ 'error' => 'Bad API key. No flush for you.' ];
 		}
 
@@ -734,9 +763,91 @@ class REST_API {
 	private function has_uses_lite( string $slug, ?array $additions = null ): bool {
 		$additions ??= (array) get_site_option( 'git_updater_additions', [] );
 		foreach ( $additions as $addition ) {
-			$addition_slug = str_contains( $addition['type'], 'plugin' ) ? dirname( $addition['slug'] ) : $addition['slug'];
+			if ( $this->get_addition_slug( (array) $addition ) === $slug && ! empty( $addition['uses_lite'] ) ) {
+				return true;
+			}
+		}
 
-			if ( $addition_slug === $slug && ! empty( $addition['uses_lite'] ) ) {
+		return false;
+	}
+
+	/**
+	 * Derive an Additions entry's package slug.
+	 *
+	 * @param array<string, mixed> $addition An entry from `git_updater_additions`.
+	 *
+	 * @return string
+	 */
+	private function get_addition_slug( array $addition ): string {
+		$type = $addition['type'] ?? '';
+		$slug = $addition['slug'] ?? '';
+
+		return str_contains( $type, 'plugin' ) ? dirname( $slug ) : $slug;
+	}
+
+	/**
+	 * Check if a slug is hard-blocked from the public API.
+	 *
+	 * The `private_package` flag on the Additions tab means "do not share": the
+	 * repo is never served, to anyone, regardless of API key or lite domain.
+	 *
+	 * @param string                                $slug      The package slug.
+	 * @param array<int, array<string, mixed>>|null $additions Pre-read Additions option; null reads the option.
+	 *
+	 * @return bool
+	 */
+	private function is_hard_blocked( string $slug, ?array $additions = null ): bool {
+		$additions ??= (array) get_site_option( 'git_updater_additions', [] );
+		foreach ( $additions as $addition ) {
+			if ( $this->get_addition_slug( (array) $addition ) === $slug ) {
+				return ! empty( $addition['private_package'] );
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether a repo requires an authorized caller to be served.
+	 *
+	 * Public/non-public is the only gate: a genuinely private repo is withheld
+	 * unless the caller presents the REST API key or a configured lite domain.
+	 *
+	 * @param bool $is_private Whether the remote repo is non-public.
+	 *
+	 * @return bool
+	 */
+	private function requires_auth( bool $is_private ): bool {
+		return $is_private;
+	}
+
+	/**
+	 * Whether the request presents a valid credential for the slug.
+	 *
+	 * Two independent credentials are accepted: the shared REST API key, or an
+	 * authorized git-updater-lite client domain for that slug.
+	 *
+	 * @param WP_REST_Request $request REST API response.
+	 * @param string          $slug    The package slug.
+	 *
+	 * @return bool
+	 */
+	private function request_is_authorized( WP_REST_Request $request, string $slug ): bool {
+		$key = $request->get_param( 'key' );
+		if ( ! empty( $key ) && hash_equals( (string) get_site_option( 'git_updater_api_key' ), (string) $key ) ) {
+			return true;
+		}
+
+		$incoming = sanitize_text_field( $request->get_header( 'X-GU-Site-Domain' ) );
+		$domains  = (array) apply_filters( 'git_updater_lite_authorized_domains', [], $slug );
+		if ( empty( $incoming ) || empty( $domains ) ) {
+			return false;
+		}
+
+		foreach ( $domains as $base_domain ) {
+			$base_domain = strtolower( trim( $base_domain ) );
+			// Matches exact domain OR any subdomain (e.g., staging.example.com, www.example.com).
+			if ( $incoming === $base_domain || str_ends_with( $incoming, '.' . $base_domain ) ) {
 				return true;
 			}
 		}
@@ -787,15 +898,21 @@ class REST_API {
 		$valid = hash_equals( $expected, $signature );
 
 		if ( ! $valid ) {
+			/*
+			 * Log the slug and expiry only. The expected signature and the secret
+			 * length are a working credential for this payload, so never write
+			 * them to the log unless explicitly debugging.
+			 */
+			$detail = apply_filters( 'gu_debug_download_signature', false )
+				? sprintf( ', sig=%s, expected=%s, secret_len=%d', $signature, $expected, strlen( $secret ) )
+				: '';
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log(
 				sprintf(
-					'git-updater verify_signature: slug=%s, expires=%d, sig=%s, expected=%s, secret_len=%d',
+					'git-updater verify_signature: slug=%s, expires=%d%s',
 					$slug,
 					$expires,
-					$signature,
-					$expected,
-					strlen( $secret )
+					$detail
 				)
 			);
 		}
@@ -813,37 +930,28 @@ class REST_API {
 	public function get_download_token( WP_REST_Request $request ) {
 		$slug = $request->get_param( 'slug' );
 
-		// 1. Optional Server-Centric Domain Validation
-		$incoming_domain    = sanitize_text_field( $request->get_header( 'X-GU-Site-Domain' ) );
-		$authorized_domains = (array) apply_filters( 'git_updater_lite_authorized_domains', [], $slug );
-
-		if ( ! empty( $authorized_domains ) ) {
-			$domain_valid = false;
-			foreach ( $authorized_domains as $base_domain ) {
-				$base_domain = strtolower( trim( $base_domain ) );
-				// Matches exact domain OR any subdomain (e.g., staging.example.com, www.example.com).
-				if ( $incoming_domain === $base_domain || str_ends_with( $incoming_domain, '.' . $base_domain ) ) {
-					$domain_valid = true;
-					break;
-				}
-			}
-
-			if ( ! $domain_valid ) {
-				return new WP_Error(
-					'gu_unauthorized_domain',
-					'Domain not authorized for this package. Please contact the plugin developer.',
-					[ 'status' => 403 ]
-				);
-			}
-		}
-
-		// 2. Standard Repo Validation (handles private_package checks, etc.)
+		// Standard repo validation (hard block, repo existence, upstream resolution).
+		// Runs first because the privacy decision below needs `is_private`.
 		$repo_api_data = $this->build_download_metadata( $slug );
 		if ( is_wp_error( $repo_api_data ) ) {
 			return $repo_api_data;
 		}
 
-		// 3. Generate and return short-lived signed URL (60 seconds for lite)
+		// Private repos are withheld unless the caller presents the REST API key
+		// or an authorized lite client domain for this slug. Kept in step with
+		// get_api_data() via the same filter so a staged rollout cannot leave the
+		// two endpoints disagreeing.
+		if ( apply_filters( 'gu_enforce_private_package_gate', true, $slug )
+			&& $this->requires_auth( (bool) $repo_api_data['is_private'] )
+			&& ! $this->request_is_authorized( $request, $slug ) ) {
+			return new WP_Error(
+				'gu_unauthorized_domain',
+				'Domain not authorized for this package. Please contact the plugin developer.',
+				[ 'status' => 403 ]
+			);
+		}
+
+		// Generate and return short-lived signed URL (60 seconds for lite).
 		$signed_url = $this->sign_download_url( $slug, 60 );
 		return rest_ensure_response( [ 'download_link' => $signed_url ] );
 	}
@@ -1044,18 +1152,12 @@ class REST_API {
 
 		// Don't allow non-shared repos via this API. Set via Additions tab.
 		$additions = get_site_option( 'git_updater_additions', [] );
-		foreach ( $additions as $addition ) {
-			$addition_slug = str_contains( $addition['type'], 'plugin' ) ? dirname( $addition['slug'] ) : $addition['slug'];
-
-			if ( $addition_slug === $slug ) {
-				if ( isset( $addition['private_package'] ) && true === (bool) $addition['private_package'] ) {
-					return new WP_Error(
-						'gu_private_package',
-						'Specified repo is not shared.',
-						[ 'status' => 403 ]
-					);
-				}
-			}
+		if ( $this->is_hard_blocked( $slug, $additions ) ) {
+			return new WP_Error(
+				'gu_private_package',
+				'Specified repo is not shared.',
+				[ 'status' => 403 ]
+			);
 		}
 
 		if ( ! array_key_exists( $slug, $gu_repos ) ) {
@@ -1123,6 +1225,9 @@ class REST_API {
 
 		$result = [
 			'download_link' => $download_link,
+			// Surface privacy so callers with request context can gate on it
+			// without a second remote fetch.
+			'is_private'    => ! empty( $repo_data->is_private ),
 		];
 
 		if ( ! empty( $auth_header['headers'] ) ) {
@@ -1150,7 +1255,8 @@ class REST_API {
 
 		try {
 			// Test for API key and exit if incorrect.
-			if ( ! hash_equals( (string) $this->get_class_vars( 'Remote_Management', 'api_key' ), (string) $request->get_param( 'key' ) ) ) {
+			$key = (string) $request->get_param( 'key' );
+			if ( ! $key || ! hash_equals( (string) get_site_option( 'git_updater_api_key' ), $key ) ) {
 				throw new UnexpectedValueException( 'Bad API key. No branch reset for you.' );
 			}
 
